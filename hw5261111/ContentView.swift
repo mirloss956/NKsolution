@@ -420,6 +420,20 @@ enum AppTab: Hashable {
     case home, characters, story, video, gallery
 }
 
+struct RootTabViewStyleModifier: ViewModifier {
+    func body(content: Content) -> some View {
+        #if os(iOS)
+        if UIDevice.current.userInterfaceIdiom == .pad {
+            content.tabViewStyle(.sidebarAdaptable)
+        } else {
+            content.tabViewStyle(.tabBarOnly)
+        }
+        #else
+        content.tabViewStyle(.sidebarAdaptable)
+        #endif
+    }
+}
+
 // MARK: - Root tabs
 struct WaterCrossRootView: View {
     @State private var selectedTab: AppTab = .home
@@ -436,7 +450,9 @@ struct WaterCrossRootView: View {
                 NavigationStack { StoryView() }
             }
             Tab("手書", systemImage: "play.rectangle.fill", value: .video) {
-                NavigationStack { VideoHubView(isActive: selectedTab == .video) }
+                NavigationStack {
+                    VideoHubView(isActive: selectedTab == .video)
+                }
             }
             Tab("圖鑑", systemImage: "square.grid.2x2.fill", value: .gallery) {
                 NavigationStack { GalleryView() }
@@ -451,7 +467,7 @@ struct WaterCrossRootView: View {
             }
             #endif
         }
-        .tabViewStyle(.sidebarAdaptable)
+        .modifier(RootTabViewStyleModifier())
         .tint(.cyan)
     }
 }
@@ -781,26 +797,329 @@ struct GalleryTile: View {
     }
 }
 
+// MARK: - Fullscreen Video Player Representable
+#if canImport(UIKit)
+import UIKit
+
+struct FullscreenVideoPlayer: UIViewControllerRepresentable {
+    let player: AVPlayer
+
+    func makeUIViewController(context: Context) -> AVPlayerViewController {
+        let controller = AVPlayerViewController()
+        controller.player = player
+        controller.showsPlaybackControls = true
+        controller.videoGravity = .resizeAspect
+        controller.allowsPictureInPicturePlayback = true
+        controller.view.backgroundColor = .white
+        return controller
+    }
+
+    func updateUIViewController(_ uiViewController: AVPlayerViewController, context: Context) {
+        if uiViewController.player !== player {
+            uiViewController.player = player
+        }
+        uiViewController.videoGravity = .resizeAspect
+        uiViewController.view.backgroundColor = .white
+    }
+}
+#elseif os(macOS)
+import AppKit
+
+struct FullscreenVideoPlayer: NSViewRepresentable {
+    let player: AVPlayer
+
+    func makeNSView(context: Context) -> AVPlayerView {
+        let view = AVPlayerView()
+        view.player = player
+        view.controlsStyle = .inline
+        view.videoGravity = .resizeAspect
+        view.wantsLayer = true
+        view.layer?.backgroundColor = NSColor.white.cgColor
+        return view
+    }
+
+    func updateNSView(_ nsView: AVPlayerView, context: Context) {
+        if nsView.player !== player {
+            nsView.player = player
+        }
+        nsView.videoGravity = .resizeAspect
+        nsView.layer?.backgroundColor = NSColor.white.cgColor
+    }
+}
+#endif
+
+#if canImport(UIKit)
+import UIKit
+
+enum TabBarControllerBridge {
+    static func setTabBarHidden(_ hidden: Bool, animated: Bool = true) {
+        guard let windowScene = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene })
+            .first(where: { $0.activationState == .foregroundActive }) ?? UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first,
+              let keyWindow = windowScene.windows.first(where: { $0.isKeyWindow }) ?? windowScene.windows.first,
+              let rootVC = keyWindow.rootViewController else {
+            return
+        }
+        guard let tabBarController = findTabBarController(in: rootVC) else { return }
+
+        if animated {
+            if !hidden {
+                tabBarController.tabBar.isHidden = false
+            }
+            UIView.animate(withDuration: 0.25, animations: {
+                tabBarController.tabBar.alpha = hidden ? 0.0 : 1.0
+            }) { _ in
+                tabBarController.tabBar.isHidden = hidden
+                tabBarController.view.setNeedsLayout()
+                tabBarController.view.layoutIfNeeded()
+            }
+        } else {
+            tabBarController.tabBar.isHidden = hidden
+            tabBarController.tabBar.alpha = hidden ? 0.0 : 1.0
+            tabBarController.view.setNeedsLayout()
+            tabBarController.view.layoutIfNeeded()
+        }
+    }
+
+    private static func findTabBarController(in vc: UIViewController) -> UITabBarController? {
+        if let tab = vc as? UITabBarController {
+            return tab
+        }
+        for child in vc.children {
+            if let tab = findTabBarController(in: child) {
+                return tab
+            }
+        }
+        if let presented = vc.presentedViewController {
+            return findTabBarController(in: presented)
+        }
+        return nil
+    }
+}
+#endif
+
+struct HideNavigationBarModifier: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(iOS 18.0, macOS 15.0, tvOS 18.0, watchOS 11.0, visionOS 2.0, *) {
+            content
+                .toolbarVisibility(.hidden, for: .navigationBar)
+        } else {
+            content
+                .toolbar(.hidden, for: .navigationBar)
+        }
+    }
+}
+
+struct TabBarVisibilityModifier: ViewModifier {
+    let isHidden: Bool
+
+    func body(content: Content) -> some View {
+        if #available(iOS 18.0, macOS 15.0, tvOS 18.0, watchOS 11.0, visionOS 2.0, *) {
+            content
+                .toolbarVisibility(isHidden ? .hidden : .visible, for: .tabBar)
+                .toolbarBackgroundVisibility(isHidden ? .hidden : .visible, for: .tabBar)
+        } else {
+            content
+                .toolbar(isHidden ? .hidden : .visible, for: .tabBar)
+                .toolbarBackground(isHidden ? .hidden : .visible, for: .tabBar)
+        }
+    }
+}
+
 // MARK: - Local hand-drawn video
 struct VideoHubView: View {
     var isActive: Bool = true
     @State private var player: AVPlayer?
+    @State private var isPlaying: Bool = true
+    @State private var isTabBarHidden: Bool = false
+    @State private var showWebViewSheet: Bool = false
+    @Environment(\.openURL) private var openURL
+
+    private let bilibiliURL = URL(string: "https://www.bilibili.com/video/BV1y7421K7Jv/?share_source=copy_web&vd_source=b049ac658b4c28cae81a7eac1d58a0c4")!
 
     var body: some View {
         ZStack {
-            SystemPageBackground()
-            VStack {
-                if let player {
-                    VideoPlayer(player: player)
-                        .clipShape(RoundedRectangle(cornerRadius: 18))
-                        .padding(.horizontal)
-                        .padding(.bottom, 8)
+            // 輕量淡雅高透明度模糊背景，顏色調淺且不干擾影片觀看
+            BlurredImageBackground(
+                imageName: "Home_Hero_Background",
+                blurRadius: 18,
+                grayOverlay: 0.0,
+                imageOpacity: 0.20,
+                lightWash: 0.72
+            )
+            .ignoresSafeArea()
+
+            if let player {
+                ZStack {
+                    FullscreenVideoPlayer(player: player)
+
+                    // 點擊影片區域快速切換 播放／暫停
+                    Color.clear
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            togglePlayPause()
+                        }
+
+                    // 暫停時在畫面中央顯示半透明播放圖示
+                    if !isPlaying {
+                        Button {
+                            togglePlayPause()
+                        } label: {
+                            Image(systemName: "play.circle.fill")
+                                .font(.system(size: 64))
+                                .foregroundStyle(.white.opacity(0.92))
+                                .shadow(color: .black.opacity(0.4), radius: 10, x: 0, y: 4)
+                        }
+                        .buttonStyle(.plain)
+                        .transition(.scale.combined(with: .opacity))
+                    }
                 }
-                Spacer(minLength: 0)
+                .aspectRatio(16.0 / 9.0, contentMode: .fit)
+                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .stroke(Color.black.opacity(0.08), lineWidth: 1)
+                )
+                .shadow(color: .black.opacity(0.12), radius: 10, x: 0, y: 4)
+                .padding(.horizontal, 24)
+                .padding(.vertical, 16)
+            }
+
+            VStack {
+                HStack(spacing: 10) {
+                    // 播放／暫停切換按鈕
+                    Button {
+                        togglePlayPause()
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                                .font(.subheadline.weight(.semibold))
+                            Text(isPlaying ? "暫停" : "播放")
+                                .font(.subheadline.weight(.medium))
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .background(.ultraThinMaterial, in: Capsule())
+                        .overlay(
+                            Capsule()
+                                .stroke(Color.primary.opacity(0.12), lineWidth: 1)
+                        )
+                        .shadow(color: .black.opacity(0.08), radius: 6, x: 0, y: 2)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.primary)
+
+                    // 轉跳至外部網頁按鈕
+                    Button {
+                        player?.pause()
+                        isPlaying = false
+                        openURL(bilibiliURL)
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "arrow.up.right.square.fill")
+                                .font(.subheadline.weight(.semibold))
+                            Text("轉跳至網頁")
+                                .font(.subheadline.weight(.medium))
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .background(.ultraThinMaterial, in: Capsule())
+                        .overlay(
+                            Capsule()
+                                .stroke(Color.primary.opacity(0.12), lineWidth: 1)
+                        )
+                        .shadow(color: .black.opacity(0.08), radius: 6, x: 0, y: 2)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.primary)
+
+                    // App 內嵌 WebView 瀏覽按鈕
+                    Button {
+                        player?.pause()
+                        isPlaying = false
+                        showWebViewSheet = true
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "safari.fill")
+                                .font(.subheadline.weight(.semibold))
+                            Text("內嵌瀏覽")
+                                .font(.subheadline.weight(.medium))
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .background(.ultraThinMaterial, in: Capsule())
+                        .overlay(
+                            Capsule()
+                                .stroke(Color.primary.opacity(0.12), lineWidth: 1)
+                        )
+                        .shadow(color: .black.opacity(0.08), radius: 6, x: 0, y: 2)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.primary)
+
+                    Spacer()
+
+                    // 切換下方導覽列顯示／隱藏
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.25)) {
+                            isTabBarHidden.toggle()
+                        }
+                        #if canImport(UIKit)
+                        TabBarControllerBridge.setTabBarHidden(isTabBarHidden, animated: true)
+                        #endif
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: isTabBarHidden ? "eye" : "eye.slash")
+                                .font(.subheadline.weight(.semibold))
+                            Text(isTabBarHidden ? "顯示導覽列" : "隱藏導覽列")
+                                .font(.subheadline.weight(.medium))
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .background(.ultraThinMaterial, in: Capsule())
+                        .overlay(
+                            Capsule()
+                                .stroke(Color.primary.opacity(0.12), lineWidth: 1)
+                        )
+                        .shadow(color: .black.opacity(0.08), radius: 6, x: 0, y: 2)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.primary)
+                }
+                .padding(.top, 10)
+                .padding(.horizontal, 16)
+
+                Spacer()
             }
         }
-        .navigationTitle("「终焉」X「End of All」")
-        .inlineNavigationBarTitle()
+        .modifier(HideNavigationBarModifier())
+        #if canImport(UIKit)
+        .navigationBarHidden(true)
+        #endif
+        .modifier(TabBarVisibilityModifier(isHidden: isTabBarHidden))
+        .sheet(isPresented: $showWebViewSheet) {
+            NavigationStack {
+                WebView(url: bilibiliURL)
+                    .ignoresSafeArea(edges: .bottom)
+                    .navigationTitle("Bilibili 手書")
+                    .inlineNavigationBarTitle()
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("關閉") {
+                                showWebViewSheet = false
+                            }
+                        }
+                        ToolbarItem(placement: .primaryAction) {
+                            Button {
+                                openURL(bilibiliURL)
+                            } label: {
+                                Image(systemName: "safari")
+                            }
+                            .accessibilityLabel("在瀏覽器中開啟")
+                        }
+                    }
+            }
+        }
         .onAppear {
             loadAndPlayLocalVideo()
             #if canImport(UIKit)
@@ -809,7 +1128,10 @@ struct VideoHubView: View {
         }
         .onDisappear {
             player?.pause()
+            isPlaying = false
+            isTabBarHidden = false
             #if canImport(UIKit)
+            TabBarControllerBridge.setTabBarHidden(false, animated: false)
             OrientationManager.unlockOrientation()
             #endif
         }
@@ -818,7 +1140,25 @@ struct VideoHubView: View {
                 loadAndPlayLocalVideo()
             } else {
                 player?.pause()
+                isPlaying = false
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: AVPlayerItem.didPlayToEndTimeNotification)) { _ in
+            isPlaying = false
+        }
+    }
+
+    private func togglePlayPause() {
+        guard let player else { return }
+        if isPlaying {
+            player.pause()
+            isPlaying = false
+        } else {
+            if let currentItem = player.currentItem, currentItem.duration.isValid, currentItem.currentTime() >= currentItem.duration {
+                player.seek(to: .zero)
+            }
+            player.play()
+            isPlaying = true
         }
     }
 
@@ -828,11 +1168,13 @@ struct VideoHubView: View {
             let newPlayer = AVPlayer(url: url)
             player = newPlayer
             newPlayer.play()
+            isPlaying = true
         } else if let player {
             if let currentItem = player.currentItem, currentItem.duration.isValid, currentItem.currentTime() >= currentItem.duration {
                 player.seek(to: .zero)
             }
             player.play()
+            isPlaying = true
         }
     }
 }
